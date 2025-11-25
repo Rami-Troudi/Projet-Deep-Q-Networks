@@ -1,91 +1,133 @@
+# plot_best_pattern.py
+
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 
 
-def compute_reward_from_features(features):
+# -----------------------
+# Array Factor utilities
+# -----------------------
+
+def compute_AF_pattern(elements_per_ring, theta0_deg):
     """
-    features = [MainLobe, SSL, HPBW, Theta0]
-    Must match the reward definition used in AntennaEnv.step().
+    Compute AF(θ) in dB for a circular multi-ring array,
+    with the same physical assumptions as the TP.
+
+    elements_per_ring : array-like of length 5 (N1..N5)
+    theta0_deg        : steering angle in degrees (from Minput[3, idx])
     """
-    MainLobe, SSL, HPBW, Theta0 = features
-    reward = MainLobe - abs(SSL) - HPBW
-    return float(reward)
+    c = 3e8
+    f = 2.45e9
+    wavelength = c / f
+    k = 2 * np.pi / wavelength
+
+    r0 = 0.2 * wavelength
+    delta_r = 0.5 * wavelength
+
+    elements_per_ring = np.array(elements_per_ring, dtype=int)
+    max_rings = len(elements_per_ring)
+
+    # Angular grid
+    theta = np.linspace(0, 2 * np.pi, 1000)
+    theta0 = np.deg2rad(theta0_deg)
+
+    AF = np.zeros_like(theta, dtype=complex)
+
+    for ring_idx in range(max_rings):
+        N = elements_per_ring[ring_idx]
+        if N <= 0:
+            continue
+
+        r = r0 + ring_idx * delta_r
+
+        for m in range(N):
+            phi_m = 2 * np.pi * m / N
+            # Simplified version of the phase term used in the TP
+            phase = k * r * np.cos(phi_m) * (np.sin(theta) - np.sin(theta0))
+            AF += np.exp(1j * phase)
+
+    # Normalize and convert to dB
+    AF_abs = np.abs(AF)
+    AF_abs /= (AF_abs.max() + 1e-12)
+    AF_dB = 20 * np.log10(AF_abs + 1e-12)
+    AF_dB[AF_dB < -40] = -40.0
+
+    theta_deg = np.rad2deg(theta)
+    return theta, theta_deg, AF_dB
+
+
+# -----------------------
+# Find best architecture (same reward as env_dataset)
+# -----------------------
+
+def find_best_index(Minput):
+    """
+    Returns index that maximizes the reward used in AntennaEnv:
+    reward = ml_norm - ssl_norm - hpbw_norm
+    """
+    Minput_T = Minput.T  # (N, 4)
+    ml = Minput_T[:, 0]
+    ssl = Minput_T[:, 1]
+    hpbw = Minput_T[:, 2]
+
+    ml_min, ml_max = ml.min(), ml.max()
+    ssl_min, ssl_max = ssl.min(), ssl.max()
+    hpbw_min, hpbw_max = hpbw.min(), hpbw.max()
+
+    def reward_from_features(features):
+        MainLobe, SSL, HPBW, Theta0 = features
+        ml_norm = (MainLobe - ml_min) / (ml_max - ml_min + 1e-8)
+        ssl_norm = (SSL - ssl_min) / (ssl_max - ssl_min + 1e-8)
+        hpbw_norm = (HPBW - hpbw_min) / (hpbw_max - hpbw_min + 1e-8)
+        return ml_norm - ssl_norm - hpbw_norm
+
+    rewards = np.array([reward_from_features(f) for f in Minput_T])
+    best_idx = int(np.argmax(rewards))
+    best_reward = float(rewards[best_idx])
+    return best_idx, best_reward
 
 
 def main():
-    # Resolve paths relative to this file, not to the current working directory
     this_dir = Path(__file__).resolve().parent
     dataset_dir = this_dir.parent / "Dataset"
 
-    minput_path = dataset_dir / "Minput.npy"
-    moutput_path = dataset_dir / "Moutput.npy"
+    Minput = np.load(dataset_dir / "Minput.npy")   # (4, N)
+    Moutput = np.load(dataset_dir / "Moutput.npy") # (5, N)
 
-    print(f"Loading Minput from:  {minput_path}")
-    print(f"Loading Moutput from: {moutput_path}")
+    # Find best index according to the same reward as the env
+    best_idx, best_reward = find_best_index(Minput)
 
-    Minput = np.load(minput_path)   # shape (4, N)
-    Moutput = np.load(moutput_path) # shape (5, N)
+    # Extract architecture + steering angle
+    elements_per_ring = Moutput[:, best_idx].astype(int)
+    features = Minput[:, best_idx]
+    theta0_deg = float(features[3])
 
-    num_samples = Minput.shape[1]
-    print(f"Number of architectures in dataset: {num_samples}")
+    print(f"Best index    : {best_idx}")
+    print(f"Best reward   : {best_reward:.3f}")
+    print(f"Theta0 (deg)  : {theta0_deg:.2f}")
+    print(f"Elements/ring : {elements_per_ring}")
 
-    best_idx = None
-    best_reward = -1e9
+    # Compute AF pattern
+    theta, theta_deg, AF_dB = compute_AF_pattern(elements_per_ring, theta0_deg)
 
-    # Scan all architectures and compute reward
-    for i in range(num_samples):
-        features = Minput[:, i]   # [MainLobe, SSL, HPBW, Theta0]
-        r = compute_reward_from_features(features)
-        if r > best_reward:
-            best_reward = r
-            best_idx = i
+    # Polar plot
+    plt.figure(figsize=(6, 6))
+    ax = plt.subplot(111, polar=True)
+    ax.plot(theta, AF_dB)
+    ax.set_title(
+        f"Radiation pattern (idx={best_idx}, reward={best_reward:.2f})",
+        va="bottom"
+    )
+    ax.set_rlim(-40, 0)
 
-    # Safety check
-    if best_idx is None:
-        print("ERROR: No best architecture found (num_samples == 0 ?)")
-        return
+ 
 
-    # Extract best features and architecture
-    best_features = Minput[:, best_idx]
-    best_arch = Moutput[:, best_idx].astype(int)
+    out_polar = this_dir / "best_pattern_polar.png"
+    plt.savefig(out_polar, dpi=300)  # last figure = cartesian
 
-    # --- Print info in console ---
-    print("\n=== Best Architecture according to the environment reward ===")
-    print(f"Index in dataset: {best_idx}")
-    print(f"Best reward: {best_reward:.3f}\n")
-
-    print("RF performance (Minput[:, idx]):")
-    print(f"  MainLobe : {best_features[0]:.3f}")
-    print(f"  SSL      : {best_features[1]:.3f}")
-    print(f"  HPBW     : {best_features[2]:.3f}")
-    print(f"  Theta0   : {best_features[3]:.3f}\n")
-
-    print("Antenna architecture (Moutput[:, idx]):")
-    for ring_id, elems in enumerate(best_arch, start=1):
-        print(f"  Ring {ring_id}: {elems} elements")
-
-    # --- Plot the best architecture as a bar chart ---
-    rings = np.arange(1, len(best_arch) + 1)
-
-    plt.figure(figsize=(6, 4))
-    plt.bar(rings, best_arch)
-    plt.xticks(rings, [f"Ring {i}" for i in rings])
-    plt.xlabel("Ring index")
-    plt.ylabel("Number of elements")
-    plt.title(f"Best architecture (idx={best_idx}, reward={best_reward:.2f})")
-    plt.grid(axis="y", linestyle="--", alpha=0.5)
-    plt.tight_layout()
-
-    out_path = this_dir / "best_architecture.png"
-    plt.savefig(out_path, dpi=300)
-    print(f"\nSaved plot to: {out_path}")
-
-    # Try to show the plot (may do nothing in some environments, but file is saved)
-    try:
-        plt.show()
-    except Exception as e:
-        print(f"plt.show() failed with: {e}")
+    print(f"Saved polar plot in: {this_dir}")
+    plt.show()
 
 
 if __name__ == "__main__":
